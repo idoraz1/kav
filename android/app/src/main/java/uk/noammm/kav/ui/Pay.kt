@@ -98,6 +98,9 @@ import javax.crypto.spec.GCMParameterSpec
 // so they are kept sealed with a key that cannot leave the phone.
 object Payer {
     @Volatile private var user: MoovitSession? = null
+    // The payment account's own login, from verifying the SMS code. Kept sealed like the user's tokens.
+    @Volatile private var account: MoovitPay.AccountToken? = null
+    private val accountLock = Any()
     private var store: android.content.SharedPreferences? = null
     private val lock = Mutex()
     private val purchases = PayPurchase()
@@ -148,6 +151,13 @@ object Payer {
         val s = ctx.getSharedPreferences("moovit-pay", Context.MODE_PRIVATE)
         store = s
         user = s.getString("user", null)?.let(Seal::open)?.let { runCatching { sessionOf(JSONObject(it)) }.getOrNull() }
+        account = s.getString("account", null)?.let(Seal::open)?.let { json ->
+            runCatching {
+                val o = JSONObject(json)
+                MoovitPay.AccountToken(o.getString("access"), o.getLong("issued"), o.getLong("expires"), o.getString("refresh"))
+            }.getOrNull()
+        }
+        MoovitPay.bearer = { bearer(it, force = false) }
         signedIn = user != null && s.getBoolean("signed-in", false)
         pending = s.getString("pending", null)?.let(Seal::open)?.let { json ->
             runCatching {
@@ -291,6 +301,34 @@ object Payer {
         store?.edit()?.putString("user", Seal.close(o.toString()))?.apply()
     }
 
+    // Kept unless the rider signed out since it was asked for.
+    private fun keepAccount(t: MoovitPay.AccountToken, replacing: MoovitPay.AccountToken?) {
+        synchronized(accountState) {
+            if (account !== replacing) return
+            account = t
+            val o = JSONObject().put("access", t.access).put("issued", t.issuedMs).put("expires", t.expiresMs)
+                .put("refresh", t.refresh)
+            store?.edit()?.putString("account", Seal.close(o.toString()))?.apply()
+        }
+    }
+
+    // The account's access token for a payment call, renewed when it is about to run out or Moovit stopped taking it.
+    private fun bearer(user: MoovitSession, force: Boolean): String? = synchronized(accountLock) {
+        val t = account ?: return null
+        if (!force && t.fresh(System.currentTimeMillis())) return t.access
+        val next = MoovitPay.renewAccount(user, t)
+        keepAccount(next, t)
+        next.access
+    }
+
+    // The SMS code, as the paying user. A verified code comes with the account's login, kept for every call after it.
+    suspend fun verify(code: String, takeOver: Boolean): MoovitPay.Verified {
+        val version = sessionVersion
+        val v = call { MoovitPay.verify(it, code, takeOver) }
+        v.token?.let { t -> if (version == sessionVersion) keepAccount(t, account) }
+        return v
+    }
+
     private suspend fun current(renew: Boolean, version: Long): MoovitSession = lock.withLock {
         if (version != sessionVersion) throw CancellationException("Payment account changed")
         val kept = user
@@ -307,14 +345,17 @@ object Payer {
         next
     }
 
-    // A call made as the paying user, off the main thread. If Moovit stops taking its access, renew once.
+    // A call made as the paying user, off the main thread. If Moovit stops taking its access, renew once: the user's,
+    // and the account's when there is one.
     suspend fun <T> call(block: (MoovitSession) -> T): T {
         val version = sessionVersion
         val result = withContext(Dispatchers.IO) {
             try {
                 block(current(false, version))
             } catch (e: MoovitPay.Unauthorized) {
-                block(current(true, version))
+                val renewed = current(true, version)
+                bearer(renewed, force = true)
+                block(renewed)
             }
         }
         if (version != sessionVersion) throw CancellationException("Payment account changed")
@@ -332,6 +373,7 @@ object Payer {
             if (purchasing || payingLater) return
             sessionVersion++
             user = null
+            account = null
             signedIn = false
             wallet = null
             lastFare = null
@@ -490,8 +532,17 @@ private fun AboutStep(n: Int, text: String) {
 private val endTrainRide get() = T("To avoid being charged the maximum daily rate, please end your train ride.",
     "כדי לא לחויב בתעריף היומי המרבי, סיימו את הנסיעה ברכבת.")
 
+// Moovit's own title and text, as its app shows them, and its error code to quote when reporting a problem.
 internal fun failure(e: Throwable): String = when (e) {
-    is MoovitPay.Refused -> e.message ?: e.title
+    is MoovitPay.Refused -> listOfNotNull(
+        e.title.takeIf { it.isNotBlank() && it != e.message },
+        e.message ?: e.title,
+        if (e.code != 0) T("Moovit error ${e.code}", "שגיאת Moovit ${e.code}") else null,
+    ).joinToString("\n")
+    is MoovitPay.Failed -> T("Moovit answered with an error (HTTP ${e.http}). Try again.",
+        "Moovit החזירה שגיאה (HTTP ${e.http}). נסו שוב.")
+    is MoovitPay.Unauthorized -> T("Moovit didn't accept this phone's sign-in. Connect your account again.",
+        "Moovit לא קיבלה את ההתחברות מהטלפון הזה. חברו את החשבון מחדש.")
     is PayPurchase.Unconfirmed -> T("Couldn't confirm the payment. Check your tickets before trying again.",
         "לא ניתן לאשר אם התשלום בוצע. בדקו את הכרטיסים לפני ניסיון נוסף.")
     else -> T("Couldn't reach Moovit. Try again.", "אין חיבור ל-Moovit. נסו שוב.")
@@ -537,7 +588,9 @@ private fun SignIn() {
         if (busy) return
         busy = true; error = null
         scope.launch {
-            try { work() } catch (e: CancellationException) { throw e } catch (e: Exception) { error = failure(e) }
+            try { work() } catch (e: CancellationException) { throw e } catch (e: Exception) {
+                android.util.Log.w("KavPay", "sign-in step failed", e); error = failure(e)
+            }
             busy = false
         }
     }
@@ -603,7 +656,7 @@ private fun SignIn() {
                     keyboard = KeyboardType.NumberPassword, autoFocus = true)
                 PayButton(T("Confirm", "אישור"), busy) {
                     if (code.length == 6) run {
-                        val v = Payer.call { MoovitPay.verify(it, code, takeOver = false) }
+                        val v = Payer.verify(code, takeOver = false)
                         // Kav can't add a card, so a number without an account is registered in Moovit's app first. The
                         // paying user that asked is dropped, and trying again starts afresh.
                         if (!v.exists) { Payer.signOut(); step = SignInStep.NoAccount }
@@ -670,7 +723,7 @@ private fun SignIn() {
             ), color = K.muted)
             PayButton(T("Connect to Kav", "חיבור ל-Kav"), busy) {
                 run {
-                    val v = Payer.call { MoovitPay.verify(it, code, takeOver = true) }
+                    val v = Payer.verify(code, takeOver = true)
                     elsewhere = false
                     finish(v.missing, v.card)
                 }

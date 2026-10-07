@@ -12,9 +12,24 @@ object MoovitPay {
     const val STEP_PAYMENT_METHOD = 8
     const val STEP_TERMS = 10
 
-    class Refused(val title: String, message: String) : Exception(message)
+    // Moovit's MVErrorMessage: a title, the text to show and Moovit's own error code (0 when Kav refuses itself).
+    class Refused(val title: String, message: String, val code: Int = 0) : Exception(message)
+
+    // Moovit answered with an error status and no message to show.
+    class Failed(val path: String, val http: Int) : java.io.IOException("$path HTTP $http")
 
     class Unauthorized : Exception("not signed in")
+
+    // The payment account's own login (MVAuthenticationInfo), which Moovit answers a verified SMS code with. Moovit's
+    // app sends its access token as a Bearer on every payment call once it has one, and Moovit refuses payment calls
+    // without it when its account_auth_required setting is on. Times are Moovit's, in milliseconds.
+    class AccountToken(val access: String, val issuedMs: Long, val expiresMs: Long, val refresh: String) {
+        // Renewed a tenth of its life early, as Moovit's app does.
+        fun fresh(nowMs: Long) = nowMs < expiresMs - (expiresMs - issuedMs) / 10
+    }
+
+    // The access token to send, renewed when it runs out. Null before the account is verified on this phone.
+    @Volatile var bearer: (MoovitSession) -> String? = { null }
 
     class Terms(
         val title: String, val text: String, val agree: String,
@@ -28,7 +43,7 @@ object MoovitPay {
 
     // exists: the number has a payment account (isAccountExist). elsewhere: it is tied to another phone, and asking again
     // with takeOver moves it here.
-    class Verified(val exists: Boolean, val elsewhere: Boolean, val missing: List<Int>, val card: Card?)
+    class Verified(val exists: Boolean, val elsewhere: Boolean, val missing: List<Int>, val card: Card?, val token: AccountToken?)
 
     class Account(val name: String, val phone: String, val connected: Boolean)
 
@@ -113,17 +128,24 @@ object MoovitPay {
     class Exit(val stopId: Int, val name: String, val price: Price?, val full: Price?, val pick: List<Int>, val title: String)
 
     // Binary Thrift both ways, as Moovit's app sends these. Null for an empty answer.
-    private fun call(user: MoovitSession, path: String, body: TWriter): Map<Int, Any?>? {
-        val (code, raw) = Moovit.post(Moovit.APP4, path, body.stop().bytes(), Moovit.authHeaders(user))
+    private fun call(user: MoovitSession, path: String, body: TWriter, account: Boolean = true): Map<Int, Any?>? {
+        val headers = Moovit.authHeaders(user).let { h ->
+            val token = if (account) bearer(user) else null
+            if (token != null) h + ("Authorization" to "Bearer $token") else h
+        }
+        val (code, raw) = Moovit.post(Moovit.APP4, path, body.stop().bytes(), headers)
         if (code == 204 || (code == 200 && raw.isEmpty())) return null
         val s = runCatching { TReader(raw).readStruct() }.getOrNull()
         // Calls with nothing to say (accepting the terms, sending the SMS) answer 200 with a body that
         // is not a struct; Moovit's app never reads it.
         if (code == 200) return s
+        // What Moovit said, for `adb logcat -s KavPay`: never the body sent, which can hold a phone number or a code.
+        android.util.Log.w("KavPay", "$path: HTTP $code, Moovit error ${s?.int(3)} ${s?.str(1).orEmpty()}")
         if (code == 401) throw Unauthorized()
         val title = s?.str(1)
-        if (title != null) throw Refused(title, s.str(2) ?: title)
-        throw java.io.IOException("$path HTTP $code")
+        val text = s?.str(2)
+        if (title != null || text != null) throw Refused(title.orEmpty(), text ?: title.orEmpty(), s?.int(3) ?: 0)
+        throw Failed(path, code)
     }
 
     private fun Map<Int, Any?>.str(id: Int) = (this[id] as? String)?.takeIf { it.isNotEmpty() }
@@ -179,11 +201,25 @@ object MoovitPay {
     // the rider and sends the same code again with it.
     fun verify(user: MoovitSession, code: String, takeOver: Boolean): Verified {
         val body = TWriter().strField(1, CONTEXT).strField(2, code).boolField(3, !takeOver)
-        val root = call(user, "PaymentContext/RegistrationVerification", body) ?: return Verified(true, false, emptyList(), null)
+        val root = call(user, "PaymentContext/RegistrationVerification", body) ?: return Verified(true, false, emptyList(), null, null)
         val steps = root.rec(2)
         return Verified(exists = root.bool(3), elsewhere = root.bool(3) && !root.bool(1), missing = steps?.ints(2).orEmpty(),
-            card = cardOf(steps))
+            card = cardOf(steps), token = tokenOf(root.rec(5), null))
     }
+
+    // MVValidationTokens under field 1, in both MVAuthenticationInfo and UserAccount/refresh's answer: the access
+    // token, then the refresh token, each issued time, expiry and token. A renewal may leave the refresh token out.
+    private fun tokenOf(m: Map<Int, Any?>?, refresh: String?): AccountToken? {
+        val tokens = m?.rec(1) ?: return null
+        val access = tokens.rec(1) ?: return null
+        return AccountToken(access.str(3) ?: return null, access.long(1) ?: 0L, access.long(2) ?: 0L,
+            tokens.rec(2)?.str(3) ?: refresh ?: return null)
+    }
+
+    // A new access token for the account, as Moovit's app asks for one: by the refresh token, without a Bearer.
+    fun renewAccount(user: MoovitSession, token: AccountToken): AccountToken =
+        tokenOf(call(user, "UserAccount/refresh", TWriter().strField(1, token.refresh), account = false), token.refresh)
+            ?: throw java.io.IOException("no account token")
 
     // Confirm the account's card on this phone with its CVV, as Moovit's app does after a move. The CVV
     // goes to Moovit once and is kept nowhere.
